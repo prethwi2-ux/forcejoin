@@ -1,0 +1,130 @@
+import logging
+from pyrogram.errors import UserNotParticipant, ChatAdminRequired, ChannelPrivate
+from pyrogram.enums import ChatMemberStatus
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from config import Config
+from database.mongo import db
+
+logger = logging.getLogger(__name__)
+
+# ── Membership statuses that count as "subscribed" ───────────────────────────
+_MEMBER_STATUSES = {
+    ChatMemberStatus.OWNER,
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.MEMBER,
+    ChatMemberStatus.RESTRICTED,   # restricted but still in the chat
+}
+
+
+async def _check_single_channel(client, bot_id: int, chat_data: dict, user_id: int) -> bool:
+    """
+    Return True if the user is considered subscribed to this channel.
+    Considers: actual membership OR a pending join request recorded in the DB.
+    """
+    chat_id = chat_data["chat_id"]
+
+    try:
+        member = await client.get_chat_member(chat_id, user_id)
+        if member.status in _MEMBER_STATUSES:
+            return True
+
+        # Status is BANNED / LEFT / not a member — fall through to join-request check
+    except UserNotParticipant:
+        pass   # Not a member — check for join request below
+    except (ChatAdminRequired, ChannelPrivate) as e:
+        # Bot lost admin rights or channel became private — treat as subscribed
+        # so the user isn't indefinitely blocked by a mis-configured channel.
+        logger.warning(f"Cannot check membership for {chat_id}: {e}. Treating as subscribed.")
+        return True
+    except Exception as e:
+        err = str(e)
+        if "Peer id invalid" in err:
+            # Try to warm up the peer cache then retry once
+            try:
+                target = chat_data.get("username") or chat_id
+                await client.get_chat(target)
+                member = await client.get_chat_member(chat_id, user_id)
+                return member.status in _MEMBER_STATUSES
+            except UserNotParticipant:
+                pass  # Still not a member — fall through to join-request check
+            except Exception as inner:
+                logger.error(f"Failed peer fallback for {chat_id}: {inner}")
+                return True   # Fail open so misconfigured channels don't forever block users
+        else:
+            logger.error(f"Unexpected error checking {chat_id} for user {user_id}: {e}")
+            return True   # Fail open on unknown errors
+
+    # ── Join-Request check (for private channels requiring requests) ──────────
+    if await db.has_pending_request(bot_id, chat_id, user_id):
+        logger.info(f"User {user_id} has a pending join-request for {chat_id} — granting access.")
+        return True
+
+    return False
+
+
+async def is_subscribed(client, user_id: int):
+    """
+    Check whether a user is subscribed to ALL mandatory channels for this bot.
+
+    Returns:
+        (True, [])                   — fully subscribed
+        (False, [missing_channels])  — list of channels still needed
+    """
+    bot_id = client.me.id
+    fsub_channels = await db.get_fsub_channels(bot_id)
+
+    if not fsub_channels:
+        return True, []
+
+    missing = []
+    for chat_data in fsub_channels:
+        subscribed = await _check_single_channel(client, bot_id, chat_data, user_id)
+        if not subscribed:
+            missing.append(chat_data)
+
+    logger.info(
+        f"SUB CHECK: User {user_id} | "
+        f"Total={len(fsub_channels)} | Missing={len(missing)}"
+    )
+
+    if missing:
+        return False, missing
+    return True, []
+
+
+def _build_channel_link(chat_data: dict) -> str:
+    """
+    Build the best possible join link for a channel, in priority order:
+    1. Custom manual link (invite links for private channels)
+    2. Public @username link
+    3. Private channel numeric link (t.me/c/...)
+    4. Fallback: tell user to search (shouldn't normally happen)
+    """
+    custom_link = chat_data.get("custom_link")
+    if custom_link:
+        return custom_link
+
+    username = chat_data.get("username")
+    if username:
+        return f"https://t.me/{username.lstrip('@')}"
+
+    chat_id = str(chat_data["chat_id"])
+    if chat_id.startswith("-100"):
+        # Private supergroup / channel  — link to channel home (message 1)
+        return f"https://t.me/c/{chat_id[4:]}/1"
+
+    # If we reach here the channel has no username and an unusual ID format.
+    # Return a safe placeholder so the button is still shown without crashing.
+    return f"https://t.me/c/{chat_id.lstrip('-')}/1"
+
+
+def get_fsub_buttons(missing_channels: list) -> InlineKeyboardMarkup:
+    """Build an inline keyboard with one join button per missing channel."""
+    buttons = []
+    for chat_data in missing_channels:
+        title = chat_data.get("title", "Channel")
+        link  = _build_channel_link(chat_data)
+        buttons.append([InlineKeyboardButton(f"📢 Join {title}", url=link)])
+
+    buttons.append([InlineKeyboardButton("✅ I've Joined — Check Again", callback_data="check_sub")])
+    return InlineKeyboardMarkup(buttons)

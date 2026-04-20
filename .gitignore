@@ -1,0 +1,15 @@
+# Sessions and Secrets
+.env
+*.session
+*.session-journal
+
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# Hosting
+.DS_Store
+.idea/
+.vscode/
+venv/
+env/

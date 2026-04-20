@@ -1,0 +1,11 @@
+# Core
+pyrogram==2.0.106
+tgcrypto # High performance encryption
+motor # Async MongoDB
+dnspython # MongoDB SRV support
+
+# Utils
+python-dotenv
+
+# Performance (Linux only, but safe in requirements)
+uvloop; platform_system != 'Windows'
