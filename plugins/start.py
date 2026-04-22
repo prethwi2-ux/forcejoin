@@ -76,7 +76,7 @@ async def start_handler(client, message: Message):
     bot_id = client.me.id
     await db.add_user(bot_id, user_id, name)
 
-    # Check subscription status
+    # ── Subscription gate — ALWAYS runs before any media delivery ─────────────
     subscribed, missing_channels = await is_subscribed(client, user_id)
 
     # ── Deep-link / file delivery ─────────────────────────────────────────────
@@ -85,10 +85,13 @@ async def start_handler(client, message: Message):
 
     if len(parts) > 1:
         media_id = parts[1].strip()
-        logger.info(f"FILE REQUEST: User {user_id} → media_id={media_id} on @{client.me.username}")
+        logger.info(
+            f"FILE REQUEST: User {user_id} → media_id={media_id} "
+            f"| subscribed={subscribed} | on @{client.me.username}"
+        )
 
         if not subscribed:
-            # Remember what they wanted so we can deliver after they subscribe
+            # Save what the user wanted — delivered automatically after they join
             await db._users.update_one(
                 {"bot_id": bot_id, "user_id": user_id},
                 {"$set": {"last_media_id": media_id}}
@@ -98,7 +101,7 @@ async def start_handler(client, message: Message):
                 reply_markup=get_fsub_buttons(missing_channels)
             )
 
-        # User is subscribed — deliver media
+        # User is confirmed subscribed — deliver media
         media = await db.get_media(bot_id, media_id)
         if media:
             success = await deliver_media(client, user_id, bot_id, media)
@@ -115,11 +118,15 @@ async def start_handler(client, message: Message):
             )
         return
 
-    # ── Plain /start — show welcome ───────────────────────────────────────────
-    await message.reply(
-        Config.START_MSG.format(name=name),
-        reply_markup=get_fsub_buttons(missing_channels) if not subscribed else None
-    )
+    # ── Plain /start — show welcome or force-sub ───────────────────────────────
+    if not subscribed:
+        return await message.reply(
+            Config.FORCE_MSG,
+            reply_markup=get_fsub_buttons(missing_channels)
+        )
+
+    await message.reply(Config.START_MSG.format(name=name))
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

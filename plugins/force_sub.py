@@ -19,48 +19,58 @@ _MEMBER_STATUSES = {
 
 async def _check_single_channel(client, bot_id: int, chat_data: dict, user_id: int) -> bool:
     """
-    Return True if the user is considered subscribed to this channel.
-    Considers: actual membership OR a pending join request recorded in the DB.
+    Return True ONLY if the user is positively confirmed as subscribed.
+    Return False in ALL error/unknown cases (fail closed).
+    This ensures media is never leaked to unsubscribed users.
     """
     chat_id = chat_data["chat_id"]
+    title   = chat_data.get("title", str(chat_id))
 
     try:
         member = await client.get_chat_member(chat_id, user_id)
         if member.status in _MEMBER_STATUSES:
             return True
+        # Status is BANNED / LEFT — definitely not subscribed
+        return False
 
-        # Status is BANNED / LEFT / not a member — fall through to join-request check
     except UserNotParticipant:
-        pass   # Not a member — check for join request below
+        # Not a member — check for a pending join request below
+        pass
+
     except (ChatAdminRequired, ChannelPrivate) as e:
-        # Bot lost admin rights or channel became private — treat as subscribed
-        # so the user isn't indefinitely blocked by a mis-configured channel.
-        logger.warning(f"Cannot check membership for {chat_id}: {e}. Treating as subscribed.")
-        return True
+        # ⚠️  Bot is NOT an admin in this channel — it cannot check membership.
+        # We MUST fail closed here, otherwise every user bypasses the gate.
+        logger.error(
+            f"[FSUB CONFIG ERROR] Cannot check '{title}' ({chat_id}): {e}. "
+            "Make the bot an ADMIN of that channel with 'Add Members' permission!"
+        )
+        return False
+
     except Exception as e:
         err = str(e)
-        if "Peer id invalid" in err:
-            # Try to warm up the peer cache then retry once
+        if "PEER_ID_INVALID" in err or "Peer id invalid" in err:
+            # Bot hasn't resolved this peer yet — warm up and retry once
             try:
                 target = chat_data.get("username") or chat_id
                 await client.get_chat(target)
                 member = await client.get_chat_member(chat_id, user_id)
                 return member.status in _MEMBER_STATUSES
             except UserNotParticipant:
-                pass  # Still not a member — fall through to join-request check
+                pass  # Confirmed not a member — fall through to join-request check
             except Exception as inner:
-                logger.error(f"Failed peer fallback for {chat_id}: {inner}")
-                return True   # Fail open so misconfigured channels don't forever block users
+                logger.error(f"[FSUB] Peer resolve failed for '{title}': {inner}")
+                return False  # Can't confirm — block access
         else:
-            logger.error(f"Unexpected error checking {chat_id} for user {user_id}: {e}")
-            return True   # Fail open on unknown errors
+            logger.error(f"[FSUB] Unexpected error checking '{title}' for user {user_id}: {e}")
+            return False  # Unknown error — block access to be safe
 
-    # ── Join-Request check (for private channels requiring requests) ──────────
+    # ── Join-Request check (for private channels set to "request to join") ────
     if await db.has_pending_request(bot_id, chat_id, user_id):
-        logger.info(f"User {user_id} has a pending join-request for {chat_id} — granting access.")
+        logger.info(f"User {user_id} has a pending join-request for '{title}' — granting access.")
         return True
 
     return False
+
 
 
 async def is_subscribed(client, user_id: int):
