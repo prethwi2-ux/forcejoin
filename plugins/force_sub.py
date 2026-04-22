@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, ChannelPrivate
 from pyrogram.enums import ChatMemberStatus
@@ -76,11 +77,15 @@ async def is_subscribed(client, user_id: int):
     if not fsub_channels:
         return True, []
 
-    missing = []
-    for chat_data in fsub_channels:
-        subscribed = await _check_single_channel(client, bot_id, chat_data, user_id)
-        if not subscribed:
-            missing.append(chat_data)
+    # ── Run all membership checks CONCURRENTLY ────────────────────────────────
+    # This fires all get_chat_member() calls in parallel instead of serially,
+    # which is critical when 100s of users check in at the same time.
+    results = await asyncio.gather(
+        *[_check_single_channel(client, bot_id, ch, user_id) for ch in fsub_channels],
+        return_exceptions=False
+    )
+
+    missing = [ch for ch, ok in zip(fsub_channels, results) if not ok]
 
     logger.info(
         f"SUB CHECK: User {user_id} | "

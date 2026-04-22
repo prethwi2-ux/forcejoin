@@ -1,7 +1,13 @@
 import logging
+import time
 import motor.motor_asyncio
 from pymongo import ASCENDING, DESCENDING
 from config import Config
+
+# ── In-memory TTL cache for fsub channel lists ────────────────────────────────
+# Key: bot_id  |  Value: (timestamp, list_of_channels)
+_FSUB_CACHE: dict = {}
+_FSUB_CACHE_TTL = 30   # seconds
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +65,25 @@ class Database:
         return await self._users.count_documents({"bot_id": bot_id})
 
     async def get_all_users(self):
-        """Return all users across every bot instance."""
-        return await self._users.find().to_list(length=1_000_000)
+        """
+        Async generator that streams all users one document at a time.
+        Use `async for user in db.get_all_users()` — never loads all into RAM.
+        """
+        async for doc in self._users.find():
+            yield doc
 
     async def get_all_users_for_bot(self, bot_id: int):
-        """Return users belonging to a specific bot instance."""
-        return await self._users.find({"bot_id": bot_id}).to_list(length=1_000_000)
+        """Async generator that streams users for a specific bot instance."""
+        async for doc in self._users.find({"bot_id": bot_id}):
+            yield doc
+
+    async def count_all_users(self) -> int:
+        """Efficiently count total users without loading them into RAM."""
+        return await self._users.estimated_document_count()
+
+    async def count_users_for_bot(self, bot_id: int) -> int:
+        """Count users for a specific bot."""
+        return await self._users.count_documents({"bot_id": bot_id})
 
     # ─────────────────────────────────────────────────────────────────────────
     # Force-Sub Channels
@@ -75,18 +94,29 @@ class Database:
             {"$set": {"title": title, "username": username}},
             upsert=True
         )
+        _FSUB_CACHE.pop(bot_id, None)   # Invalidate cache on write
 
     async def remove_fsub_channel(self, bot_id: int, chat_id: int):
         await self._fsub.delete_one({"bot_id": bot_id, "chat_id": chat_id})
+        _FSUB_CACHE.pop(bot_id, None)   # Invalidate cache on write
 
     async def update_fsub_link(self, bot_id: int, chat_id: int, custom_link: str):
         await self._fsub.update_one(
             {"bot_id": bot_id, "chat_id": chat_id},
             {"$set": {"custom_link": custom_link}}
         )
+        _FSUB_CACHE.pop(bot_id, None)   # Invalidate cache on write
 
-    async def get_fsub_channels(self, bot_id: int):
-        return await self._fsub.find({"bot_id": bot_id}).to_list(length=100)
+    async def get_fsub_channels(self, bot_id: int) -> list:
+        """Return the bot's fsub channel list, using an in-memory TTL cache."""
+        now = time.monotonic()
+        cached = _FSUB_CACHE.get(bot_id)
+        if cached and (now - cached[0]) < _FSUB_CACHE_TTL:
+            return cached[1]
+
+        channels = await self._fsub.find({"bot_id": bot_id}).to_list(length=100)
+        _FSUB_CACHE[bot_id] = (now, channels)
+        return channels
 
     # ─────────────────────────────────────────────────────────────────────────
     # Join Requests

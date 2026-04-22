@@ -110,9 +110,8 @@ async def broadcast_handler(client, message: Message, bot_manager):
         except Exception as e:
             logger.warning(f"Could not map clone client during broadcast: {e}")
 
-    # Fetch all users across all bots
-    all_users   = await db.get_all_users()
-    total_users = len(all_users)
+    # Count users without loading them into RAM
+    total_users = await db.count_all_users()
 
     status_msg = await message.reply(
         f"<b>🚀 Broadcast Starting…</b>\n\n"
@@ -121,9 +120,11 @@ async def broadcast_handler(client, message: Message, bot_manager):
 
     sent    = 0
     failed  = 0
-    blocked = 0
+    i       = 0
 
-    for i, user in enumerate(all_users, start=1):
+    # Stream users one at a time — never loads all into RAM
+    async for user in db.get_all_users():
+        i += 1
         u_id = user["user_id"]
         b_id = user.get("bot_id")
 
@@ -134,8 +135,6 @@ async def broadcast_handler(client, message: Message, bot_manager):
         if success:
             sent += 1
         else:
-            # Distinguish blocked vs other failures via exception type —
-            # _send_to_user already handled FloodWait; count the rest as failed.
             failed += 1
 
         # Add a small delay to avoid hitting rate limits
