@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from pyrogram import Client, idle
 from config import Config
 from manager import bot_manager
@@ -18,12 +19,35 @@ logging.getLogger("motor").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+async def health_check():
+    """Lightweight HTTP server to satisfy Render's health check."""
+    async def handle_request(reader, writer):
+        # Read the request (optional, but keep the connection clean)
+        await reader.read(100)
+        # Respond with a standard HTTP 200 OK
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK")
+        await writer.drain()
+        writer.close()
+
+    port = int(os.environ.get("PORT", 10000))
+    try:
+        server = await asyncio.start_server(handle_request, "0.0.0.0", port)
+        logger.info(f"⚓ Render health check server online on port {port}")
+        async with server:
+            await server.serve_forever()
+    except Exception as e:
+        logger.error(f"Failed to start health check server: {e}")
+
+
 async def run_bots():
     # ── 1. Setup DB indexes ───────────────────────────────────────────────────
     logger.info("Setting up database indexes…")
     await db.setup_indexes()
 
-    # ── 2. Start the Master Bot ───────────────────────────────────────────────
+    # ── 2. Start Health Check (for Render) ────────────────────────────────────
+    asyncio.create_task(health_check())
+
+    # ── 3. Start the Master Bot ───────────────────────────────────────────────
     master_bot = Client(
         name="MasterBot",
         api_id=Config.API_ID,
