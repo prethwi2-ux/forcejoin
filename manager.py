@@ -2,6 +2,7 @@ import logging
 import re
 from pyrogram import Client, filters
 from pyrogram.types import Message, ChatJoinRequest
+from pyrogram.handlers import MessageHandler, CallbackQueryHandler, ChatJoinRequestHandler
 from database.mongo import db
 from config import Config
 
@@ -11,7 +12,8 @@ from plugins.admin_settings import (
     settings_panel, manage_channels_menu, remove_channel_callback,
     add_channel_prompt, handle_channel_input, manage_media_menu,
     delete_media_callback, stats_panel_callback, back_to_settings,
-    close_panel, set_link_prompt, clear_link_callback
+    close_panel, set_link_prompt, clear_link_callback,
+    auto_delete_menu, set_auto_delete_callback, autodel_custom_prompt,
 )
 from plugins.media_handler import (
     post_media, show_stats, ping_pong,
@@ -22,7 +24,8 @@ from plugins.clone import (
     my_bots, stop_bot_command, TOKEN_REGEX
 )
 from plugins.join_request import handle_join_request
-from plugins.broadcast import broadcast_handler
+from plugins.broadcast import broadcast_handler, clone_broadcast_handler
+from plugins.help import help_handler
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,44 @@ class BotManager:
     def __init__(self):
         # Maps bot_token → running Client instance
         self.clients: dict[str, Client] = {}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Build a Client using a StringSession stored in MongoDB
+    # ─────────────────────────────────────────────────────────────────────────
+    async def _build_client(self, bot_token: str) -> Client:
+        """
+        Create a Pyrogram Client backed by a StringSession.
+        If a saved session string exists in DB, use it (avoids re-auth).
+        After connecting, save the updated session string back to DB
+        so no .session files are ever written to disk.
+        """
+        from pyrogram.types import TermsOfService  # noqa
+        try:
+            from pyrogram import StringSession
+        except ImportError:
+            from pyrogram.storage import StringSession  # older pyrogram
+
+        saved = await db.load_session(bot_token)
+        session = StringSession(saved) if saved else StringSession()
+
+        client = Client(
+            name=bot_token.split(":")[0],        # used as internal identifier
+            api_id=Config.API_ID,
+            api_hash=Config.API_HASH,
+            bot_token=bot_token,
+            session_string=saved or "",           # empty string = fresh session
+            in_memory=True,                       # ← no .session file on disk
+        )
+        return client
+
+    async def _persist_session(self, bot_token: str, client: Client):
+        """Export and save the session string to MongoDB after a successful start."""
+        try:
+            session_string = await client.export_session_string()
+            await db.save_session(bot_token, session_string)
+            logger.info(f"💾 Session persisted to DB for token {bot_token[:12]}…")
+        except Exception as e:
+            logger.warning(f"Could not persist session: {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Handler Registration
@@ -43,6 +84,9 @@ class BotManager:
 
         @client.on_message(filters.regex(r"^/start") & filters.private)
         async def _start(c, m): await start_handler(c, m)
+
+        @client.on_message(filters.regex(r"^/help") & filters.private)
+        async def _help(c, m): await help_handler(c, m)
 
         @client.on_message(filters.regex(r"^/settings") & filters.private)
         async def _settings(c, m): await settings_panel(c, m)
@@ -74,10 +118,13 @@ class BotManager:
         @client.on_message(filters.regex(r"^/global_stats") & filters.private)
         async def _g_stats(c, m): await global_stats(c, m)
 
+        # /broadcast: global (master bot, owner only) vs clone (clone bot owner)
         @client.on_message(filters.regex(r"^/broadcast") & filters.private)
         async def _broadcast(c, m):
             if c.me.id == Config.MASTER_BOT_ID:
                 await broadcast_handler(c, m, self)
+            else:
+                await clone_broadcast_handler(c, m)
 
         # Auto-detect bot token input
         @client.on_message(filters.regex(TOKEN_REGEX) & filters.private)
@@ -118,12 +165,24 @@ class BotManager:
         @client.on_callback_query(filters.regex("^close_panel$"))
         async def _close(c, cb): await close_panel(c, cb)
 
+        # Auto-Delete callbacks
+        @client.on_callback_query(filters.regex("^auto_delete_menu$"))
+        async def _ad_menu(c, cb): await auto_delete_menu(c, cb)
+
+        @client.on_callback_query(filters.regex("^set_autodel_"))
+        async def _set_ad(c, cb): await set_auto_delete_callback(c, cb)
+
+        @client.on_callback_query(filters.regex("^autodel_custom$"))
+        async def _custom_ad(c, cb): await autodel_custom_prompt(c, cb)
+
         # ── General message input (non-command) ───────────────────────────────
         @client.on_message(
             filters.private
-            & ~filters.command(["start", "clone", "settings", "post", "ping",
-                                "batch", "done", "stop_bot", "my_bots",
-                                "global_stats", "stats", "broadcast"]),
+            & ~filters.command([
+                "start", "help", "clone", "settings", "post", "ping",
+                "batch", "done", "stop_bot", "my_bots",
+                "global_stats", "stats", "broadcast"
+            ]),
             group=1
         )
         async def _input(c, m):
@@ -145,15 +204,19 @@ class BotManager:
 
         try:
             client = Client(
-                name=f"bot_{bot_token.split(':')[0]}",
+                name=bot_token.split(":")[0],
                 api_id=Config.API_ID,
                 api_hash=Config.API_HASH,
-                bot_token=bot_token
+                bot_token=bot_token,
+                in_memory=True,          # ← Session stays in RAM / DB, never on disk
             )
 
             self.register_handlers(client)
             await client.start()
             me = await client.get_me()
+
+            # Persist session string to DB right away
+            await self._persist_session(bot_token, client)
 
             # Warm up the peer cache for all configured channels
             logger.info(f"🔥 Warming up peers for @{me.username}…")
@@ -178,7 +241,7 @@ class BotManager:
             return False, str(e)
 
     async def stop_clone(self, bot_token: str) -> bool:
-        """Stop a running clone and remove it from DB. Returns True on success."""
+        """Stop a running clone and cascade-delete all its data from DB."""
         if bot_token not in self.clients:
             return False
 
@@ -189,8 +252,9 @@ class BotManager:
         finally:
             del self.clients[bot_token]
 
+        # Cascade-delete: users, media, channels, settings, session, states, batches
         await db.remove_clone(bot_token)
-        logger.info(f"🔴 Clone STOPPED: token={bot_token[:12]}…")
+        logger.info(f"🔴 Clone STOPPED + data purged: token={bot_token[:12]}…")
         return True
 
     async def load_all(self):

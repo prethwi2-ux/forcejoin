@@ -22,9 +22,7 @@ logger = logging.getLogger(__name__)
 async def health_check():
     """Lightweight HTTP server to satisfy Render's health check."""
     async def handle_request(reader, writer):
-        # Read the request (optional, but keep the connection clean)
         await reader.read(100)
-        # Respond with a standard HTTP 200 OK
         writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK")
         await writer.drain()
         writer.close()
@@ -32,7 +30,7 @@ async def health_check():
     port = int(os.environ.get("PORT", 10000))
     try:
         server = await asyncio.start_server(handle_request, "0.0.0.0", port)
-        logger.info(f"⚓ Render health check server online on port {port}")
+        logger.info(f"⚓ Health check server online on port {port}")
         async with server:
             await server.serve_forever()
     except Exception as e:
@@ -47,32 +45,36 @@ async def run_bots():
     # ── 2. Start Health Check (for Render) ────────────────────────────────────
     asyncio.create_task(health_check())
 
-    # ── 3. Start the Master Bot ───────────────────────────────────────────────
+    # ── 3. Start the Master Bot (in_memory=True → no .session file) ──────────
     master_bot = Client(
         name="MasterBot",
         api_id=Config.API_ID,
         api_hash=Config.API_HASH,
-        bot_token=Config.BOT_TOKEN
+        bot_token=Config.BOT_TOKEN,
+        in_memory=True,          # ← Never write session files to disk
     )
 
     bot_manager.register_handlers(master_bot)
     await master_bot.start()
+
+    # Persist master session to DB
+    await bot_manager._persist_session(Config.BOT_TOKEN, master_bot)
 
     me = await master_bot.get_me()
     Config.MASTER_BOT_ID = me.id   # Override with the live, reliable value
 
     logger.info(f"✅ Master Bot online: @{me.username} (ID: {me.id})")
 
-    # ── 3. Restore all persisted clone bots ───────────────────────────────────
+    # ── 4. Restore all persisted clone bots ───────────────────────────────────
     logger.info("Starting saved clones…")
     await bot_manager.load_all()
     logger.info(f"✅ {len(bot_manager.clients)} clone(s) running.")
 
-    # ── 4. Keep the event loop alive ─────────────────────────────────────────
+    # ── 5. Keep the event loop alive ─────────────────────────────────────────
     logger.info("Bot is running. Press Ctrl+C to stop.")
     await idle()
 
-    # ── 5. Graceful shutdown ──────────────────────────────────────────────────
+    # ── 6. Graceful shutdown ──────────────────────────────────────────────────
     logger.info("Shutting down…")
     await master_bot.stop()
     for token, client in list(bot_manager.clients.items()):
@@ -84,7 +86,6 @@ async def run_bots():
 
 
 if __name__ == "__main__":
-    # Validate the most critical config before doing anything
     if not Config.BOT_TOKEN:
         logger.critical("BOT_TOKEN is missing from .env — cannot start!")
         raise SystemExit(1)
@@ -99,7 +100,7 @@ if __name__ == "__main__":
         uvloop.install()
         logger.info("uvloop installed for improved performance.")
     except ImportError:
-        pass   # uvloop is not available on Windows — that's fine
+        pass   # Not available on Windows — fine
 
     try:
         asyncio.run(run_bots())

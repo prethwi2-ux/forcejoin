@@ -2,6 +2,7 @@ import logging
 from pyrogram import Client
 from config import Config
 from database.mongo import db
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,12 @@ async def is_bot_owner(client: Client, user_id: int) -> bool:
 
     # 1. Global master admin always wins
     if user_id == int(Config.OWNER_ID):
+        logger.info(
+            f"👑 MASTER OWNER INTERACTION:\n"
+            f"   • Bot: @{client.me.username} (ID: {client.me.id})\n"
+            f"   • Owner ID: {user_id}\n"
+            f"   • Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
         return True
 
     # 2. No-one else controls the Master Bot itself
@@ -37,6 +44,12 @@ async def is_bot_owner(client: Client, user_id: int) -> bool:
     })
 
     if clone_info and int(clone_info.get("user_id", -1)) == user_id:
+        logger.info(
+            f"👑 CLONE OWNER INTERACTION:\n"
+            f"   • Bot: @{client.me.username} (ID: {client.me.id})\n"
+            f"   • Owner ID: {user_id}\n"
+            f"   • Time: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
         return True
 
     logger.warning(

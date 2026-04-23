@@ -155,7 +155,7 @@ async def stop_bot_command(client, message: Message):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# /global_stats — master admin only
+# /global_stats — master admin only — ENHANCED
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def global_stats(client, message: Message):
@@ -164,14 +164,44 @@ async def global_stats(client, message: Message):
     if message.from_user.id != Config.OWNER_ID:
         return
 
-    all_clones  = await db.get_all_clones()
-    total_users = await db._users.count_documents({})
-    total_media = await db._media.count_documents({})
+    from manager import bot_manager  # local import to avoid circular dependency
 
-    await message.reply(
-        f"<b>🌍 Global Statistics</b>\n\n"
-        f"🤖 <b>Cloned Bots:</b> {len(all_clones)}\n"
-        f"👤 <b>Total Users:</b> {total_users}\n"
-        f"📁 <b>Stored Files:</b> {total_media}\n\n"
-        f"<i>The Master Bot is only used for cloning and administration.</i>"
-    )
+    # Collect all per-bot data
+    clone_stats   = await db.get_clone_stats()
+    total_users   = await db._users.count_documents({})
+    total_media   = await db._media.count_documents({})
+    total_channels= await db._fsub.count_documents({})
+    total_clones  = len(clone_stats)
+
+    # Build per-bot breakdown
+    lines = [
+        "📊 <b>Global Statistics</b>\n",
+        f"🤖 <b>Total Cloned Bots:</b> {total_clones}",
+        f"👥 <b>Total Users:</b> {total_users}",
+        f"📁 <b>Total Stored Media:</b> {total_media}",
+        f"📢 <b>Total Fsub Channels:</b> {total_channels}",
+        "",
+        "━━━━━━━━━━━━━━━━━━━",
+        "📋 <b>Per-Bot Breakdown:</b>\n",
+    ]
+
+    for i, cs in enumerate(clone_stats, 1):
+        username = cs["bot_username"]
+        # Check if clone is currently online
+        is_online = any(
+            True for c in bot_manager.clients.values()
+            if getattr(c.me, "id", None) == cs["bot_id"]
+        )
+        status = "🟢 Online" if is_online else "🔴 Offline"
+        lines.append(
+            f"<b>{i}. @{username}</b> [{status}]\n"
+            f"   👤 Users: <b>{cs['user_count']}</b>  "
+            f"📁 Media: <b>{cs['media_count']}</b>  "
+            f"📢 Channels: <b>{cs['channel_count']}</b>\n"
+            f"   👑 Owner ID: <code>{cs['owner_id']}</code>"
+        )
+
+    if not clone_stats:
+        lines.append("<i>No cloned bots found yet.</i>")
+
+    await message.reply("\n".join(lines))

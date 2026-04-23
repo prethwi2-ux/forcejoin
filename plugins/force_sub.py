@@ -3,6 +3,7 @@ import logging
 from pyrogram.errors import UserNotParticipant, ChatAdminRequired, ChannelPrivate
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import time
 from config import Config
 from database.mongo import db
 
@@ -82,6 +83,17 @@ async def is_subscribed(client, user_id: int):
         (False, [missing_channels])  — list of channels still needed
     """
     bot_id = client.me.id
+    
+    # ── Layer 0: Check DB Membership Cache ────────────────────────────────────
+    # If the user was verified successfully within the last 3 minutes, 
+    # skip the Telegram API call to prevent FloodWait during high traffic.
+    user_data = await db._users.find_one({"bot_id": bot_id, "user_id": user_id})
+    if user_data:
+        last_check = user_data.get("last_fsub_check_at", 0)
+        if (time.time() - last_check) < 180:   # 3 minutes cache
+            logger.info(f"SUB CHECK: User {user_id} - [CACHED SUCCESS]")
+            return True, []
+
     fsub_channels = await db.get_fsub_channels(bot_id)
 
     if not fsub_channels:
@@ -104,6 +116,12 @@ async def is_subscribed(client, user_id: int):
 
     if missing:
         return False, missing
+    
+    # ── Success: Update DB Cache ──────────────────────────────────────────────
+    await db._users.update_one(
+        {"bot_id": bot_id, "user_id": user_id},
+        {"$set": {"last_fsub_check_at": time.time()}}
+    )
     return True, []
 
 

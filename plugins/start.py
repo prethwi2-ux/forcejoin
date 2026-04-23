@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from pyrogram.types import Message, CallbackQuery
 from config import Config
@@ -8,40 +9,64 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Auto-Delete Task
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _schedule_delete(client, chat_id: int, message_ids: list[int], delay_secs: int):
+    """Background task: wait `delay_secs` then delete the given messages."""
+    try:
+        await asyncio.sleep(delay_secs)
+        for mid in message_ids:
+            try:
+                await client.delete_messages(chat_id, mid)
+            except Exception:
+                pass   # Already deleted or unavailable — ignore silently
+    except asyncio.CancelledError:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Media Delivery Helper
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def deliver_media(client, user_id: int, bot_id: int, media: dict) -> bool:
     """
     Copy all messages in a media record to the user.
+    If auto_delete_secs > 0 for this bot, schedule deletion of the sent messages.
     Returns True if at least one message was delivered successfully.
     """
     chat_id     = media["chat_id"]
     message_ids = media.get("message_ids") or [media.get("message_id")]
 
-    delivered = 0
+    delivered      = 0
+    sent_msg_ids   = []   # Track message IDs of what we actually sent to the user
+
     for m_id in message_ids:
         if m_id is None:
             continue
         try:
-            await client.copy_message(
+            sent = await client.copy_message(
                 chat_id=user_id,
                 from_chat_id=chat_id,
                 message_id=m_id
             )
             delivered += 1
+            if sent:
+                sent_msg_ids.append(sent.id)
         except Exception as e:
             err = str(e)
             if "Peer id invalid" in err:
                 # Warm up peer cache and retry once
                 try:
                     await client.get_chat(chat_id)
-                    await client.copy_message(
+                    sent = await client.copy_message(
                         chat_id=user_id,
                         from_chat_id=chat_id,
                         message_id=m_id
                     )
                     delivered += 1
+                    if sent:
+                        sent_msg_ids.append(sent.id)
                 except Exception as inner:
                     logger.error(f"Delivery failed for msg {m_id} after peer resolve: {inner}")
             elif "chat not found" in err.lower() or "channel invalid" in err.lower():
@@ -51,6 +76,38 @@ async def deliver_media(client, user_id: int, bot_id: int, media: dict) -> bool:
                 )
             else:
                 logger.error(f"Delivery error for msg {m_id}: {e}")
+
+    # ── Auto-Delete: schedule if configured ───────────────────────────────────
+    if delivered > 0 and sent_msg_ids:
+        auto_secs = await db.get_bot_setting(bot_id, "auto_delete_secs", 0)
+        if auto_secs and auto_secs > 0:
+            from plugins.admin_settings import _format_secs
+            
+            # Send the notification message and track its ID for deletion too
+            try:
+                display_time = _format_secs(auto_secs)
+                notif = await client.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"<b>⏳ Auto-Delete Active!</b>\n\n"
+                        f"This media will be automatically deleted in "
+                        f"<b>{display_time}</b> due to security reasons. "
+                        f"Please save it to your <b>Saved Messages</b> if needed."
+                    ),
+                    disable_web_page_preview=True
+                )
+                if notif:
+                    sent_msg_ids.append(notif.id)
+            except Exception as e:
+                logger.warning(f"Failed to send auto-delete notice: {e}")
+
+            asyncio.create_task(
+                _schedule_delete(client, user_id, sent_msg_ids, auto_secs)
+            )
+            logger.info(
+                f"Auto-delete scheduled: {len(sent_msg_ids)} msg(s) for user {user_id} "
+                f"in {auto_secs}s (bot {bot_id})"
+            )
 
     return delivered > 0
 
